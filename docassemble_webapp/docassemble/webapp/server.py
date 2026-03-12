@@ -5151,6 +5151,37 @@ class KeycloakSignIn(OAuthSignIn):
             info_dict['first_name'] = me.get('given_name')
         if 'family_name' in me:
             info_dict['last_name'] = me.get('family_name')
+        # Extract roles from Keycloak access token (JWT) for role synchronization
+        keycloak_roles = []
+        try:
+            access_token = oauth_session.access_token
+            if access_token:
+                # Decode the JWT payload without verification (token was received directly from Keycloak over TLS)
+                payload_part = access_token.split('.')[1]
+                # Add padding if needed
+                padding = 4 - len(payload_part) % 4
+                if padding != 4:
+                    payload_part += '=' * padding
+                token_payload = json.loads(base64.urlsafe_b64decode(payload_part).decode('utf-8'))
+                # Extract realm roles
+                realm_access = token_payload.get('realm_access', {})
+                realm_roles = realm_access.get('roles', [])
+                logmessage("keycloak: realm_access roles from token: " + str(realm_roles))
+                keycloak_roles.extend(realm_roles)
+                # Also extract client-specific roles if configured
+                resource_access = token_payload.get('resource_access', {})
+                client_id = daconfig['oauth']['keycloak'].get('id', '')
+                if client_id and client_id in resource_access:
+                    client_roles = resource_access[client_id].get('roles', [])
+                    logmessage("keycloak: client roles from token for " + str(client_id) + ": " + str(client_roles))
+                    keycloak_roles.extend(client_roles)
+                # Remove duplicates
+                keycloak_roles = list(set(keycloak_roles))
+                logmessage("keycloak: all roles from token (before filter): " + str(keycloak_roles))
+        except Exception as e:
+            logmessage("keycloak: error extracting roles from access token: " + str(e))
+        # Always pass keycloak_roles (even if empty) so sync runs and removes stale roles
+        info_dict['keycloak_roles'] = keycloak_roles
         return social_id, username, email, info_dict
 
 
@@ -5367,6 +5398,49 @@ def oauth_callback(provider):
             user.language = name_data['language']
         db.session.add(user)
         db.session.commit()
+    # Synchronize Keycloak roles with docassemble roles on every login (new or existing user)
+    if 'keycloak_roles' in name_data and provider == 'keycloak' and daconfig.get('oauth', {}).get('keycloak', {}).get('sync roles', True):
+        try:
+            kc_roles = name_data['keycloak_roles']
+            # Filter out Keycloak internal roles that should not be mapped
+            kc_internal = {'uma_authorization', 'offline_access', 'default-roles-master', 'uma_protection', 'create-realm'}
+            kc_roles_filtered = [r for r in kc_roles if r not in kc_internal]
+            # Map Keycloak role names to docassemble role names (configurable mapping)
+            role_mapping = daconfig.get('oauth', {}).get('keycloak', {}).get('role mapping', {})
+            mapped_roles = set()
+            for kc_role in kc_roles_filtered:
+                if kc_role in role_mapping:
+                    mapped_roles.add(role_mapping[kc_role])
+                else:
+                    mapped_roles.add(kc_role)
+            # Get the user's current roles for comparison
+            current_roles = set(role.name for role in user.roles)
+            # Only update if roles have changed
+            if current_roles != mapped_roles:
+                removed_roles = current_roles - mapped_roles
+                added_roles = mapped_roles - current_roles
+                logmessage("keycloak: role change detected for user " + str(email) +
+                           " | previous: " + str(sorted(current_roles)) +
+                           " | new: " + str(sorted(mapped_roles)) +
+                           " | added: " + str(sorted(added_roles)) +
+                           " | removed: " + str(sorted(removed_roles)))
+                # Clear existing roles and apply the latest Keycloak roles
+                user.roles = []
+                for role_name in mapped_roles:
+                    da_role = db.session.execute(select(Role).where(Role.name == role_name)).scalar()
+                    if da_role is None:
+                        da_role = Role(name=role_name)
+                        db.session.add(da_role)
+                        db.session.flush()
+                    user.roles.append(da_role)
+                # Also update social_id if the user was previously local
+                if user.social_id and user.social_id.startswith('local'):
+                    user.social_id = social_id
+                db.session.commit()
+            else:
+                logmessage("keycloak: roles unchanged for user " + str(email) + ": " + str(sorted(current_roles)))
+        except Exception as e:
+            logmessage("keycloak: error syncing roles: " + str(e))
     session["_flashes"] = []
     login_user(user, remember=False)
     update_last_login(user)

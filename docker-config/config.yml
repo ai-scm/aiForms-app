@@ -1,0 +1,15 @@
+debug: true
+enable playground: true
+allow log viewing: true
+allow demo: true
+exitpage: https://docassemble.org
+oauth:
+  keycloak:
+    enable: True
+    id: bnd-devs-AIForms
+    secret: uk07j6jXxNPvJTnIEhF8apDUPdXsKzi8
+    domain: iam.devs.ia.blend360.com
+    realm: master
+    protocol: "https://"
+    sync roles: True
+    role mapping: {}
